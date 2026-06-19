@@ -2,9 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (gosu lets the entrypoint drop from root to `app`)
 RUN apt-get update && apt-get install -y \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for faster dependency management
@@ -24,7 +25,9 @@ RUN mkdir -p /app/store_creds \
     && chown -R app:app /app/store_creds \
     && chmod 755 /app/store_creds
 
-USER app
+# Container starts as root so the entrypoint can chown the Railway persistent
+# volume (mounted at /data, root-owned) before dropping to the unprivileged
+# `app` user via gosu. Do NOT add `USER app` here.
 
 # Expose port (use default of 8000 if PORT not set)
 EXPOSE 8000
@@ -42,4 +45,4 @@ ENV TOOLS=""
 
 # Use entrypoint for the base command and CMD for args
 ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
+CMD ["mkdir -p /data/credentials /data/oauth-proxy && chown -R app:app /data && exec gosu app uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
