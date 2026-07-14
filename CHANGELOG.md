@@ -10,6 +10,7 @@
 ### Changed
 
 - Extend Gmail tool tiers and operator documentation for the new read, thread-label, and draft-reconciliation primitives. Cause: the restricted Inbox Operator service needs an explicit Gmail-only complete surface. Impact: deployment can expose the required tools without enabling Gmail send or unrelated Workspace products.
+- Set Railway restart policy to `ALWAYS`. Cause: a graceful process exit under `ON_FAILURE` can leave an OAuth MCP permanently stopped. Impact: both the existing generic service and the dedicated Inbox Operator service recover from any process exit. Evidence: Railway manifest verification required after GitHub auto-deploy.
 
 ### Baseline
 
