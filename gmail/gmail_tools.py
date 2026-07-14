@@ -8,6 +8,7 @@ import logging
 import asyncio
 import base64
 import binascii
+import json
 import re
 import ssl
 import mimetypes
@@ -21,6 +22,7 @@ from email.policy import SMTP
 from email.utils import formataddr
 
 import httpx
+from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from pydantic import Field
@@ -77,6 +79,22 @@ LOW_VALUE_TEXT_FOOTER_MARKERS = (
 )
 LOW_VALUE_TEXT_HTML_DIFF_MIN = 80
 CONTENT_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-@]*$")
+
+
+def _build_gmail_metadata_fields(part_depth: int = 20) -> str:
+    """Build a partial-response mask that excludes MIME body data."""
+    part_fields = "filename,mimeType,body(attachmentId,size)"
+    for _ in range(part_depth):
+        part_fields = (
+            "filename,mimeType,body(attachmentId,size),parts(" + part_fields + ")"
+        )
+    return (
+        "id,threadId,labelIds,internalDate,snippet,"
+        f"payload(headers,filename,mimeType,body(attachmentId,size),parts({part_fields}))"
+    )
+
+
+GMAIL_MESSAGE_METADATA_FIELDS = _build_gmail_metadata_fields()
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -319,11 +337,14 @@ def _build_message_get_request(
     service,
     message_id: str,
     message_format: Literal["metadata", "full", "raw"],
+    fields: Optional[str] = None,
 ):
     """Build a Gmail messages.get request for the requested format."""
     request_kwargs = {"userId": "me", "id": message_id, "format": message_format}
     if message_format == "metadata":
         request_kwargs["metadataHeaders"] = GMAIL_METADATA_HEADERS
+    if fields:
+        request_kwargs["fields"] = fields
     return service.users().messages().get(**request_kwargs)
 
 
@@ -343,6 +364,7 @@ async def _fetch_message_with_retry(
     message_id: str,
     message_format: Literal["metadata", "full", "raw"],
     log_prefix: str,
+    fields: Optional[str] = None,
     max_retries: int = 3,
 ):
     """Fetch a single Gmail message with SSL retry handling."""
@@ -350,7 +372,10 @@ async def _fetch_message_with_retry(
         try:
             message = await asyncio.to_thread(
                 _build_message_get_request(
-                    service, message_id=message_id, message_format=message_format
+                    service,
+                    message_id=message_id,
+                    message_format=message_format,
+                    fields=fields,
                 ).execute
             )
             return message_id, message, None
@@ -368,6 +393,125 @@ async def _fetch_message_with_retry(
                 return message_id, None, ssl_error
         except Exception as exc:
             return message_id, None, exc
+
+
+def _normalize_unique_resource_ids(
+    values: List[str], field_name: str, max_unique: int
+) -> List[str]:
+    """Validate and de-duplicate Gmail resource IDs while preserving order."""
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{field_name} must contain at least one ID.")
+
+    normalized: List[str] = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must contain non-empty string IDs.")
+        resource_id = value.strip()
+        if resource_id not in seen:
+            seen.add(resource_id)
+            normalized.append(resource_id)
+
+    if len(normalized) > max_unique:
+        raise ValueError(
+            f"{field_name} cannot contain more than {max_unique} unique IDs."
+        )
+    return normalized
+
+
+def _normalize_selected_headers(
+    header_names: Optional[List[str]],
+) -> List[str]:
+    """Validate requested header names and de-duplicate case-insensitively."""
+    if header_names is None:
+        return list(GMAIL_METADATA_HEADERS)
+    if not isinstance(header_names, list):
+        raise ValueError("header_names must be a list of header names.")
+
+    normalized: List[str] = []
+    seen = set()
+    for value in header_names:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("header_names must contain non-empty strings.")
+        header_name = value.strip()
+        key = header_name.lower()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(header_name)
+    return normalized
+
+
+async def _fetch_messages_batch_fail_closed(
+    service,
+    message_ids: List[str],
+    message_format: Literal["metadata", "full"],
+    log_prefix: str,
+    fields: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch message chunks, retry batch misses sequentially, and reject partials."""
+    fetched: Dict[str, Dict[str, Any]] = {}
+
+    for chunk_start in range(0, len(message_ids), GMAIL_BATCH_SIZE):
+        chunk_ids = message_ids[chunk_start : chunk_start + GMAIL_BATCH_SIZE]
+        results: Dict[str, Dict[str, Any]] = {}
+
+        def batch_callback(request_id, response, exception):
+            results[request_id] = {"data": response, "error": exception}
+
+        try:
+            batch = service.new_batch_http_request(callback=batch_callback)
+            for message_id in chunk_ids:
+                batch.add(
+                    _build_message_get_request(
+                        service,
+                        message_id=message_id,
+                        message_format=message_format,
+                        fields=fields,
+                    ),
+                    request_id=message_id,
+                )
+            await asyncio.to_thread(batch.execute)
+        except Exception as batch_error:
+            logger.warning(
+                "[%s] Batch fetch failed, retrying the chunk sequentially: %s",
+                log_prefix,
+                batch_error,
+            )
+            results = {}
+
+        retry_ids = [
+            message_id
+            for message_id in chunk_ids
+            if not results.get(message_id, {}).get("data")
+            or results.get(message_id, {}).get("error")
+        ]
+        for message_id in retry_ids:
+            result_id, message, error = await _fetch_message_with_retry(
+                service,
+                message_id=message_id,
+                message_format=message_format,
+                log_prefix=log_prefix,
+                fields=fields,
+            )
+            results[result_id] = {"data": message, "error": error}
+            await asyncio.sleep(GMAIL_REQUEST_DELAY)
+
+        failures = []
+        for message_id in chunk_ids:
+            entry = results.get(message_id)
+            if not entry or entry.get("error") or not entry.get("data"):
+                detail = entry.get("error") if entry else "no result"
+                failures.append(f"{message_id}: {detail}")
+                continue
+            fetched[message_id] = entry["data"]
+
+        if failures:
+            raise ToolError(
+                f"{log_prefix} failed closed; no partial result returned: "
+                + "; ".join(failures)
+            )
+
+    return fetched
 
 
 async def _fetch_raw_message_contents(
@@ -1322,6 +1466,136 @@ def _format_gmail_results_plain(
     return "\n".join(lines)
 
 
+async def _save_gmail_draft(
+    service,
+    user_google_email: str,
+    subject: str,
+    body: str,
+    body_format: Literal["plain", "html"] = "plain",
+    to: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    from_name: Optional[str] = None,
+    from_email: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    include_signature: bool = True,
+    quote_original: bool = False,
+    draft_id: Optional[str] = None,
+) -> str:
+    """Create or replace a Gmail draft using the shared MIME preparation path."""
+    if draft_id is not None:
+        if not isinstance(draft_id, str) or not draft_id.strip():
+            raise ValueError("draft_id must be a non-empty string when provided.")
+        draft_id = draft_id.strip()
+
+    operation = "update" if draft_id else "create"
+    logger.info(
+        "[_save_gmail_draft] Email: '%s', Subject: '%s', Operation: '%s'",
+        user_google_email,
+        subject,
+        operation,
+    )
+
+    sender_email = from_email or user_google_email
+    prepared_body = body
+    signature_html = ""
+    if include_signature:
+        signature_html = await _get_send_as_signature_html_for_tool(
+            service, from_email=sender_email
+        )
+
+    reply_context = None
+    if thread_id and (quote_original or not in_reply_to or not references or not to):
+        reply_context = await _fetch_thread_reply_context(
+            service,
+            thread_id,
+            in_reply_to=in_reply_to,
+            include_bodies=quote_original,
+        )
+
+    if thread_id and (not in_reply_to or not references):
+        thread_message_ids = (
+            reply_context.get("message_ids", []) if reply_context else []
+        )
+        in_reply_to, references = _derive_reply_headers(
+            thread_message_ids, in_reply_to, references
+        )
+
+    target_reply = reply_context.get("target") if reply_context else None
+    if thread_id and not to and target_reply:
+        to = target_reply.get("reply_to") or target_reply.get("from") or to
+    if thread_id and not subject.strip() and target_reply:
+        subject = target_reply.get("subject") or subject
+
+    if quote_original and target_reply:
+        prepared_body = _build_quoted_reply_body(
+            prepared_body,
+            body_format,
+            signature_html,
+            {
+                "sender": target_reply.get("from") or "unknown",
+                "date": target_reply.get("date", ""),
+                "text_body": target_reply.get("text_body", ""),
+                "html_body": target_reply.get("html_body", ""),
+            },
+        )
+    else:
+        prepared_body = _append_signature_to_body(
+            prepared_body, body_format, signature_html
+        )
+
+    resolved_attachments = await _resolve_url_attachments(attachments)
+    raw_message, _thread_id_final, attached_count, attachment_errors = (
+        _prepare_gmail_message(
+            subject=subject,
+            body=prepared_body,
+            body_format=body_format,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            thread_id=thread_id,
+            in_reply_to=in_reply_to,
+            references=references,
+            from_email=sender_email,
+            from_name=from_name,
+            attachments=resolved_attachments,
+        )
+    )
+
+    requested_attachment_count = len(attachments or [])
+    if requested_attachment_count > 0 and attached_count == 0:
+        details = (
+            f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
+        )
+        raise UserInputError(
+            "No valid attachments were added. Verify each attachment path/content and retry."
+            f"{details}"
+        )
+
+    # Keep reply threading in the raw headers. Setting message.threadId here can
+    # create drafts that Gmail's UI does not render.
+    request_body = {"message": {"raw": raw_message}}
+    drafts_resource = service.users().drafts()
+    if draft_id:
+        request = drafts_resource.update(userId="me", id=draft_id, body=request_body)
+    else:
+        request = drafts_resource.create(userId="me", body=request_body)
+
+    saved_draft = await asyncio.to_thread(
+        request.execute,
+        num_retries=GOOGLE_API_WRITE_RETRIES,
+    )
+    saved_draft_id = saved_draft.get("id") or draft_id
+    attachment_info = _format_attachment_result(
+        attached_count, requested_attachment_count
+    )
+    action = "updated" if draft_id else "created"
+    return f"Draft {action}{attachment_info}! Draft ID: {saved_draft_id}"
+
+
 @server.tool(
     title="Search Gmail Messages",
     annotations=ToolAnnotations(
@@ -1392,6 +1666,86 @@ async def search_gmail_messages(
             "[search_gmail_messages] More results available (next_page_token present)"
         )
     return formatted_output
+
+
+@server.tool(
+    title="Search Gmail Message Index",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors(
+    "search_gmail_message_index", is_read_only=True, service_type="gmail"
+)
+@require_google_service("gmail", "gmail_read")
+async def search_gmail_message_index(
+    service,
+    query: str,
+    user_google_email: str,
+    page_size: Annotated[
+        int,
+        Field(
+            description="Maximum number of message references to return (1-500).",
+            ge=1,
+            le=500,
+        ),
+    ] = 500,
+    page_token: Optional[str] = None,
+) -> str:
+    """Return a machine-readable page of Gmail message and thread references."""
+    if not isinstance(page_size, int) or isinstance(page_size, bool):
+        raise ValueError("page_size must be an integer between 1 and 500.")
+    if page_size < 1 or page_size > 500:
+        raise ValueError("page_size must be between 1 and 500.")
+    if not isinstance(query, str):
+        raise ValueError("query must be a string.")
+
+    request_params: Dict[str, Any] = {
+        "userId": "me",
+        "q": query,
+        "maxResults": page_size,
+    }
+    if page_token:
+        request_params["pageToken"] = page_token
+
+    logger.info(
+        "[search_gmail_message_index] Email: '%s', Query: '%s', Page size: %s",
+        user_google_email,
+        query,
+        page_size,
+    )
+    response = await asyncio.to_thread(
+        service.users().messages().list(**request_params).execute
+    )
+    if not isinstance(response, dict):
+        raise ToolError("Gmail messages.list returned no usable response.")
+
+    refs = []
+    for index, message in enumerate(response.get("messages") or []):
+        if (
+            not isinstance(message, dict)
+            or not message.get("id")
+            or not message.get("threadId")
+        ):
+            raise ToolError(
+                f"Gmail messages.list returned an incomplete reference at index {index}."
+            )
+        refs.append(
+            {
+                "message_id": message["id"],
+                "thread_id": message["threadId"],
+            }
+        )
+
+    result = {
+        "refs": refs,
+        "next_page_token": response.get("nextPageToken"),
+        "result_size_estimate": response.get("resultSizeEstimate", 0),
+    }
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 @server.tool(
@@ -1701,6 +2055,117 @@ async def get_gmail_messages_content_batch(
     final_output += "\n---\n\n".join(output_messages)
 
     return final_output
+
+
+@server.tool(
+    title="Get Gmail Messages Metadata Batch",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors(
+    "get_gmail_messages_metadata_batch", is_read_only=True, service_type="gmail"
+)
+@require_google_service("gmail", "gmail_read")
+async def get_gmail_messages_metadata_batch(
+    service,
+    message_ids: StringList,
+    user_google_email: str,
+    header_names: Annotated[
+        Optional[StringList],
+        Field(
+            description=(
+                "Headers to return. Defaults to the standard Gmail metadata headers."
+            ),
+            json_schema_extra={"type": "array", "items": {"type": "string"}},
+        ),
+    ] = None,
+) -> str:
+    """Return machine-readable Gmail metadata for at most 100 messages.
+
+    Gmail's ``full`` format is required to expose attachment metadata. Message
+    bodies are discarded and never included in the returned JSON.
+    """
+    if not isinstance(message_ids, list) or not message_ids:
+        raise ValueError("message_ids must contain at least one ID.")
+    if len(message_ids) > 100:
+        raise ValueError("message_ids cannot contain more than 100 IDs.")
+
+    normalized_ids = _normalize_unique_resource_ids(
+        message_ids, "message_ids", max_unique=100
+    )
+    selected_headers = _normalize_selected_headers(header_names)
+    logger.info(
+        "[get_gmail_messages_metadata_batch] Email: '%s', Message count: %s",
+        user_google_email,
+        len(normalized_ids),
+    )
+
+    fetched = await _fetch_messages_batch_fail_closed(
+        service,
+        message_ids=normalized_ids,
+        message_format="full",
+        log_prefix="get_gmail_messages_metadata_batch",
+        fields=GMAIL_MESSAGE_METADATA_FIELDS,
+    )
+
+    messages = []
+    for requested_id in normalized_ids:
+        message = fetched.get(requested_id)
+        if not isinstance(message, dict):
+            raise ToolError(
+                "get_gmail_messages_metadata_batch failed closed; "
+                f"message {requested_id} returned malformed data."
+            )
+        if message.get("id") != requested_id:
+            raise ToolError(
+                "get_gmail_messages_metadata_batch failed closed; "
+                f"message ID mismatch for {requested_id}."
+            )
+
+        thread_id = message.get("threadId")
+        payload = message.get("payload") or {}
+        label_ids = message.get("labelIds") or []
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ToolError(
+                "get_gmail_messages_metadata_batch failed closed; "
+                f"message {requested_id} has no thread ID."
+            )
+        if not isinstance(payload, dict) or not isinstance(label_ids, list):
+            raise ToolError(
+                "get_gmail_messages_metadata_batch failed closed; "
+                f"message {requested_id} returned malformed metadata."
+            )
+
+        attachments = [
+            {
+                "filename": attachment["filename"],
+                "mime_type": attachment["mimeType"],
+                "size": attachment["size"],
+                "attachment_id": attachment["attachmentId"],
+            }
+            for attachment in _extract_attachments(payload)
+        ]
+        messages.append(
+            {
+                "message_id": requested_id,
+                "thread_id": thread_id,
+                "label_ids": label_ids,
+                "internal_date": message.get("internalDate"),
+                "snippet": message.get("snippet") or "",
+                "headers": _extract_headers(payload, selected_headers),
+                "attachments": attachments,
+            }
+        )
+
+    return json.dumps(
+        {"messages": messages, "count": len(messages)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @server.tool(
@@ -2330,97 +2795,199 @@ async def draft_gmail_message(
     logger.info(
         f"[draft_gmail_message] Invoked. Email: '{user_google_email}', Subject: '{subject}'"
     )
-
-    # Prepare the email message
-    # Use from_email (Send As alias) if provided, otherwise default to authenticated user
-    sender_email = from_email or user_google_email
-    draft_body = body
-    signature_html = ""
-    if include_signature:
-        signature_html = await _get_send_as_signature_html_for_tool(
-            service, from_email=sender_email
-        )
-
-    reply_context = None
-    if thread_id and (quote_original or not in_reply_to or not references or not to):
-        reply_context = await _fetch_thread_reply_context(
-            service,
-            thread_id,
-            in_reply_to=in_reply_to,
-            include_bodies=quote_original,
-        )
-
-    if thread_id and (not in_reply_to or not references):
-        thread_message_ids = (
-            reply_context.get("message_ids", []) if reply_context else []
-        )
-        in_reply_to, references = _derive_reply_headers(
-            thread_message_ids, in_reply_to, references
-        )
-
-    target_reply = reply_context.get("target") if reply_context else None
-    if thread_id and not to and target_reply:
-        to = target_reply.get("reply_to") or target_reply.get("from") or to
-    if thread_id and not subject.strip() and target_reply:
-        subject = target_reply.get("subject") or subject
-
-    if quote_original and target_reply:
-        draft_body = _build_quoted_reply_body(
-            draft_body,
-            body_format,
-            signature_html,
-            {
-                "sender": target_reply.get("from") or "unknown",
-                "date": target_reply.get("date", ""),
-                "text_body": target_reply.get("text_body", ""),
-                "html_body": target_reply.get("html_body", ""),
-            },
-        )
-    else:
-        draft_body = _append_signature_to_body(draft_body, body_format, signature_html)
-
-    resolved_attachments = await _resolve_url_attachments(attachments)
-    raw_message, _thread_id_final, attached_count, attachment_errors = (
-        _prepare_gmail_message(
-            subject=subject,
-            body=draft_body,
-            body_format=body_format,
-            to=to,
-            cc=cc,
-            bcc=bcc,
-            thread_id=thread_id,
-            in_reply_to=in_reply_to,
-            references=references,
-            from_email=sender_email,
-            from_name=from_name,
-            attachments=resolved_attachments,
-        )
+    return await _save_gmail_draft(
+        service=service,
+        user_google_email=user_google_email,
+        subject=subject,
+        body=body,
+        body_format=body_format,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        from_name=from_name,
+        from_email=from_email,
+        thread_id=thread_id,
+        in_reply_to=in_reply_to,
+        references=references,
+        attachments=attachments,
+        include_signature=include_signature,
+        quote_original=quote_original,
     )
 
-    requested_attachment_count = len(attachments or [])
-    if requested_attachment_count > 0 and attached_count == 0:
-        details = (
-            f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
-        )
-        raise UserInputError(
-            "No valid attachments were added. Verify each attachment path/content and retry."
-            f"{details}"
-        )
 
-    # Create a draft instead of sending. Keep reply threading in the raw
-    # headers; setting message.threadId here can create Gmail UI-hidden drafts.
-    draft_body = {"message": {"raw": raw_message}}
+@server.tool(
+    title="List Gmail Drafts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("list_gmail_drafts", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def list_gmail_drafts(
+    service,
+    user_google_email: str,
+    page_size: Annotated[
+        int,
+        Field(
+            description="Maximum number of drafts to return (1-500).",
+            ge=1,
+            le=500,
+        ),
+    ] = 25,
+    page_token: Optional[str] = None,
+    query: Annotated[
+        Optional[str],
+        Field(description="Optional Gmail search query used to filter drafts."),
+    ] = None,
+) -> str:
+    """List drafts with stable draft IDs and message metadata for reconciliation."""
+    if not isinstance(page_size, int) or isinstance(page_size, bool):
+        raise ValueError("page_size must be an integer between 1 and 500.")
+    if page_size < 1 or page_size > 500:
+        raise ValueError("page_size must be between 1 and 500.")
 
-    # Create the draft
-    created_draft = await asyncio.to_thread(
-        service.users().drafts().create(userId="me", body=draft_body).execute,
-        num_retries=GOOGLE_API_WRITE_RETRIES,
+    request_params: Dict[str, Any] = {
+        "userId": "me",
+        "maxResults": page_size,
+    }
+    if page_token:
+        request_params["pageToken"] = page_token
+    if query and query.strip():
+        request_params["q"] = query.strip()
+
+    logger.info(
+        "[list_gmail_drafts] Email: '%s', Page size: %s, Query: '%s'",
+        user_google_email,
+        page_size,
+        query or "",
     )
-    draft_id = created_draft.get("id")
-    attachment_info = _format_attachment_result(
-        attached_count, requested_attachment_count
+    response = await asyncio.to_thread(
+        service.users().drafts().list(**request_params).execute
     )
-    return f"Draft created{attachment_info}! Draft ID: {draft_id}"
+    drafts = response.get("drafts") or []
+    if not drafts:
+        return "No drafts found."
+
+    header_names = ["Subject", "To", "Cc", "From", "Date", "Message-ID"]
+    lines = [f"Found {len(drafts)} drafts:", ""]
+    for index, draft_summary in enumerate(drafts, 1):
+        draft_id = draft_summary.get("id") or "(unknown)"
+        summary_message = draft_summary.get("message") or {}
+        draft_data = draft_summary
+        if draft_id != "(unknown)":
+            draft_data = await asyncio.to_thread(
+                service.users()
+                .drafts()
+                .get(
+                    userId="me",
+                    id=draft_id,
+                    format="metadata",
+                )
+                .execute
+            )
+
+        message = draft_data.get("message") or summary_message
+        message_id = message.get("id") or "(unknown)"
+        thread_id = message.get("threadId") or "(none)"
+        payload = message.get("payload") or {}
+        headers = _extract_headers(payload, header_names)
+        subject = headers.get("Subject") or "(no subject)"
+        recipient = headers.get("To") or "(no recipient)"
+
+        lines.extend(
+            [
+                f"{index}. Draft ID: {draft_id}",
+                f"   Gmail Message ID: {message_id}",
+                f"   Thread ID: {thread_id}",
+                f"   Subject: {subject}",
+                f"   To: {recipient}",
+            ]
+        )
+        lines.append("")
+
+    next_page_token = response.get("nextPageToken")
+    if next_page_token:
+        lines.append(
+            "Pagination: call list_gmail_drafts again with "
+            f"page_token='{next_page_token}'."
+        )
+    return "\n".join(lines).rstrip()
+
+
+@server.tool(
+    title="Upsert Gmail Draft",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("upsert_gmail_draft", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def upsert_gmail_draft(
+    service,
+    user_google_email: str,
+    subject: Annotated[str, Field(description="Email subject.")],
+    body: Annotated[str, Field(description="Email body (plain text or HTML).")],
+    draft_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Existing Gmail draft ID to replace in place. Omit to create a new "
+                "draft. Supplying the same draft_id on retries avoids duplicate drafts."
+            )
+        ),
+    ] = None,
+    body_format: Annotated[
+        Literal["plain", "html"],
+        Field(description="Email body format: 'plain' or 'html'."),
+    ] = "plain",
+    to: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    from_name: Optional[str] = None,
+    from_email: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    attachments: Annotated[
+        Optional[DictList],
+        Field(
+            description="Optional attachments in the same format as draft_gmail_message."
+        ),
+    ] = None,
+    include_signature: bool = True,
+    quote_original: bool = False,
+) -> str:
+    """Create a draft or idempotently replace an existing draft by draft ID.
+
+    The update path calls ``users.drafts.update`` and is retry-safe when callers
+    keep the same ``draft_id``. Omitting ``draft_id`` creates a new draft, so the
+    tool-level annotation remains non-idempotent for accuracy.
+    """
+    return await _save_gmail_draft(
+        service=service,
+        user_google_email=user_google_email,
+        subject=subject,
+        body=body,
+        body_format=body_format,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        from_name=from_name,
+        from_email=from_email,
+        thread_id=thread_id,
+        in_reply_to=in_reply_to,
+        references=references,
+        attachments=attachments,
+        include_signature=include_signature,
+        quote_original=quote_original,
+        draft_id=draft_id,
+    )
 
 
 def _format_thread_content(
@@ -2493,12 +3060,13 @@ def _format_thread_content(
 
         # Extract attachment metadata for this message
         attachments = _extract_attachments(payload)
-        message_id = message.get("id", "")
+        message_id = message.get("id") or "(unknown)"
 
         # Add message to content
         content_lines.extend(
             [
                 f"=== Message {i} ===",
+                f"Gmail Message ID: {message_id}",
                 f"From: {sender}",
                 f"Date: {date}",
             ]
@@ -3098,6 +3666,293 @@ async def manage_gmail_filter(
         raise ValueError(
             f"Invalid action '{action_lower}'. Must be 'create' or 'delete'."
         )
+
+
+def _validate_thread_label_modification(
+    thread_id: str,
+    add_label_ids: Optional[List[str]],
+    remove_label_ids: Optional[List[str]],
+) -> tuple[str, List[str], List[str]]:
+    """Normalize a thread label mutation and reject ambiguous requests."""
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        raise ValueError("thread_id must be a non-empty string.")
+
+    add_ids, remove_ids = _normalize_label_modification(add_label_ids, remove_label_ids)
+    return thread_id.strip(), add_ids, remove_ids
+
+
+def _normalize_label_modification(
+    add_label_ids: Optional[List[str]],
+    remove_label_ids: Optional[List[str]],
+) -> tuple[List[str], List[str]]:
+    """Normalize Gmail label mutations shared by single and batch tools."""
+
+    def normalize(values: Optional[List[str]], field_name: str) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for value in values or []:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must contain non-empty label IDs.")
+            label_id = value.strip()
+            if label_id not in seen:
+                seen.add(label_id)
+                normalized.append(label_id)
+        if len(normalized) > 100:
+            raise ValueError(f"{field_name} cannot contain more than 100 label IDs.")
+        return normalized
+
+    add_ids = normalize(add_label_ids, "add_label_ids")
+    remove_ids = normalize(remove_label_ids, "remove_label_ids")
+    if not add_ids and not remove_ids:
+        raise ValueError(
+            "At least one of add_label_ids or remove_label_ids must be provided."
+        )
+
+    overlap = sorted(set(add_ids) & set(remove_ids))
+    if overlap:
+        raise ValueError(
+            "The same label cannot be added and removed in one request: "
+            + ", ".join(overlap)
+        )
+
+    return add_ids, remove_ids
+
+
+def _is_retryable_gmail_error(error: Exception) -> bool:
+    """Return whether a Gmail write error is safe to retry."""
+    if isinstance(error, (ssl.SSLError, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(error, HttpError):
+        return getattr(error.resp, "status", None) in {
+            408,
+            429,
+            500,
+            502,
+            503,
+            504,
+        }
+    return False
+
+
+async def _modify_thread_labels_with_retry(
+    service,
+    thread_id: str,
+    body: Dict[str, List[str]],
+    log_prefix: str,
+    max_retries: int = 3,
+) -> tuple[str, Optional[Dict[str, Any]], Optional[Exception]]:
+    """Modify one thread with bounded exponential backoff for transient errors."""
+    for attempt in range(max_retries):
+        try:
+            response = await asyncio.to_thread(
+                service.users()
+                .threads()
+                .modify(userId="me", id=thread_id, body=body)
+                .execute,
+                num_retries=GOOGLE_API_WRITE_RETRIES,
+            )
+            return thread_id, response, None
+        except Exception as error:
+            if _is_retryable_gmail_error(error) and attempt < max_retries - 1:
+                delay = 2**attempt
+                logger.warning(
+                    "[%s] Transient error for thread %s on attempt %s: %s. "
+                    "Retrying in %ss.",
+                    log_prefix,
+                    thread_id,
+                    attempt + 1,
+                    error,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            return thread_id, None, error
+
+    return thread_id, None, RuntimeError("Thread label retry loop ended unexpectedly.")
+
+
+async def _modify_threads_batch_fail_closed(
+    service,
+    thread_ids: List[str],
+    body: Dict[str, List[str]],
+    log_prefix: str,
+) -> None:
+    """Modify thread chunks, retry failures, and never report partial success."""
+    for chunk_start in range(0, len(thread_ids), GMAIL_BATCH_SIZE):
+        chunk_ids = thread_ids[chunk_start : chunk_start + GMAIL_BATCH_SIZE]
+        results: Dict[str, Dict[str, Any]] = {}
+
+        def batch_callback(request_id, response, exception):
+            results[request_id] = {"data": response, "error": exception}
+
+        try:
+            batch = service.new_batch_http_request(callback=batch_callback)
+            for thread_id in chunk_ids:
+                batch.add(
+                    service.users()
+                    .threads()
+                    .modify(userId="me", id=thread_id, body=body),
+                    request_id=thread_id,
+                )
+            await asyncio.to_thread(batch.execute)
+        except Exception as batch_error:
+            logger.warning(
+                "[%s] Batch modify failed, retrying the chunk sequentially: %s",
+                log_prefix,
+                batch_error,
+            )
+            results = {}
+
+        retry_ids = [
+            thread_id
+            for thread_id in chunk_ids
+            if thread_id not in results or results[thread_id].get("error") is not None
+        ]
+        for thread_id in retry_ids:
+            result_id, response, error = await _modify_thread_labels_with_retry(
+                service,
+                thread_id=thread_id,
+                body=body,
+                log_prefix=log_prefix,
+            )
+            results[result_id] = {"data": response, "error": error}
+            await asyncio.sleep(GMAIL_REQUEST_DELAY)
+
+        failures = []
+        for thread_id in chunk_ids:
+            entry = results.get(thread_id)
+            if not entry or entry.get("error") is not None:
+                detail = entry.get("error") if entry else "no result"
+                failures.append(f"{thread_id}: {detail}")
+
+        if failures:
+            raise ToolError(
+                f"{log_prefix} failed closed; no partial success returned: "
+                + "; ".join(failures)
+            )
+
+
+@server.tool(
+    title="Modify Gmail Thread Labels",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("modify_gmail_thread_labels", service_type="gmail")
+@require_google_service("gmail", GMAIL_MODIFY_SCOPE)
+async def modify_gmail_thread_labels(
+    service,
+    user_google_email: str,
+    thread_id: str,
+    add_label_ids: Annotated[
+        Optional[StringList],
+        Field(json_schema_extra={"type": "array", "items": {"type": "string"}}),
+    ] = None,
+    remove_label_ids: Annotated[
+        Optional[StringList],
+        Field(json_schema_extra={"type": "array", "items": {"type": "string"}}),
+    ] = None,
+) -> str:
+    """Add or remove labels across every message in a Gmail thread.
+
+    Repeating the same request is idempotent. Removing ``INBOX`` archives the
+    complete thread; removing ``UNREAD`` marks the complete thread as read.
+    """
+    thread_id, add_ids, remove_ids = _validate_thread_label_modification(
+        thread_id, add_label_ids, remove_label_ids
+    )
+    logger.info(
+        "[modify_gmail_thread_labels] Email: '%s', Thread ID: '%s'",
+        user_google_email,
+        thread_id,
+    )
+
+    body: Dict[str, List[str]] = {}
+    if add_ids:
+        body["addLabelIds"] = add_ids
+    if remove_ids:
+        body["removeLabelIds"] = remove_ids
+
+    await asyncio.to_thread(
+        service.users().threads().modify(userId="me", id=thread_id, body=body).execute,
+        num_retries=GOOGLE_API_WRITE_RETRIES,
+    )
+
+    actions = []
+    if add_ids:
+        actions.append(f"Added labels: {', '.join(add_ids)}")
+    if remove_ids:
+        actions.append(f"Removed labels: {', '.join(remove_ids)}")
+    return f"Thread labels updated successfully!\nThread ID: {thread_id}\n" + "; ".join(
+        actions
+    )
+
+
+@server.tool(
+    title="Batch Modify Gmail Thread Labels",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("batch_modify_gmail_thread_labels", service_type="gmail")
+@require_google_service("gmail", GMAIL_MODIFY_SCOPE)
+async def batch_modify_gmail_thread_labels(
+    service,
+    user_google_email: str,
+    thread_ids: StringList,
+    add_label_ids: Annotated[
+        Optional[StringList],
+        Field(json_schema_extra={"type": "array", "items": {"type": "string"}}),
+    ] = None,
+    remove_label_ids: Annotated[
+        Optional[StringList],
+        Field(json_schema_extra={"type": "array", "items": {"type": "string"}}),
+    ] = None,
+) -> str:
+    """Add or remove labels across at most 100 unique Gmail threads.
+
+    The operation is idempotent. Any missing or failed batch result is retried
+    and then raises without returning partial success.
+    """
+    normalized_thread_ids = _normalize_unique_resource_ids(
+        thread_ids, "thread_ids", max_unique=100
+    )
+    add_ids, remove_ids = _normalize_label_modification(add_label_ids, remove_label_ids)
+
+    body: Dict[str, List[str]] = {}
+    if add_ids:
+        body["addLabelIds"] = add_ids
+    if remove_ids:
+        body["removeLabelIds"] = remove_ids
+
+    logger.info(
+        "[batch_modify_gmail_thread_labels] Email: '%s', Thread count: %s",
+        user_google_email,
+        len(normalized_thread_ids),
+    )
+    await _modify_threads_batch_fail_closed(
+        service,
+        thread_ids=normalized_thread_ids,
+        body=body,
+        log_prefix="batch_modify_gmail_thread_labels",
+    )
+
+    return json.dumps(
+        {
+            "updated_thread_ids": normalized_thread_ids,
+            "thread_count": len(normalized_thread_ids),
+            "added_label_ids": add_ids,
+            "removed_label_ids": remove_ids,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @server.tool(

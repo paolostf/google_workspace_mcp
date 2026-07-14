@@ -6,18 +6,24 @@ gmail:
     - send_gmail_message
 
   extended:
+    - search_gmail_message_index
+    - get_gmail_messages_metadata_batch
     - get_gmail_attachment_content
     - get_gmail_thread_content
     - modify_gmail_message_labels
+    - modify_gmail_thread_labels
     - list_gmail_labels
     - manage_gmail_label
     - draft_gmail_message
+    - list_gmail_drafts
+    - upsert_gmail_draft
     - list_gmail_filters
     - manage_gmail_filter
 
   complete:
     - get_gmail_threads_content_batch
     - batch_modify_gmail_message_labels
+    - batch_modify_gmail_thread_labels
     - start_google_auth
 
 drive:

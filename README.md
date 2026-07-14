@@ -577,6 +577,16 @@ Note: there is a public (but abandoned) pypi package with the same name - do not
 uv run workspace-cli list
 uv run workspace-cli --url https://custom.server/mcp list
 
+# Keep one encrypted OAuth session per Google account on the same server
+uv run workspace-cli --url https://custom.server/mcp --profile gws-personal list
+uv run workspace-cli --url https://custom.server/mcp --profile gws-business list
+
+# Request explicit scopes from a server already configured for that surface.
+# The server may add its own required scopes; use WORKSPACE_MCP_PERMISSIONS
+# on the server for an enforceable least-privilege boundary.
+uv run workspace-cli --url https://custom.server/mcp --profile inbox-personal \
+  --scopes "openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/gmail.compose" list
+
 # Or, if installed globally:
 workspace-cli list
 workspace-cli --url https://custom.server/mcp list
