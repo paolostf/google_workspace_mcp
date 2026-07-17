@@ -2407,9 +2407,13 @@ async def draft_gmail_message(
             f"{details}"
         )
 
-    # Create a draft instead of sending. Keep reply threading in the raw
-    # headers; setting message.threadId here can create Gmail UI-hidden drafts.
+    # Create a draft instead of sending. Gmail requires message.threadId plus
+    # RFC-compliant In-Reply-To/References headers to add a draft to a thread.
+    # If we could not derive the headers, fall back to an unthreaded draft
+    # instead of sending an invalid thread request.
     draft_body = {"message": {"raw": raw_message}}
+    if thread_id and in_reply_to and references:
+        draft_body["message"]["threadId"] = thread_id
 
     # Create the draft
     created_draft = await asyncio.to_thread(
