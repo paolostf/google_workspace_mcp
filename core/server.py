@@ -728,6 +728,151 @@ async def serve_attachment(request: Request):
     )
 
 
+# Gmail's own attachment ceiling; uploads larger than this could never be sent.
+# Kept as a local constant: gmail_tools imports core.server, so importing its
+# MAX_EMAIL_ATTACHMENT_BYTES here would create a circular import.
+MAX_UPLOAD_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB
+
+
+def _upload_auth_error(detail: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": detail},
+        status_code=401,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def _verify_upload_bearer(request: Request) -> Optional[JSONResponse]:
+    """Require the same bearer auth as the MCP endpoint for attachment uploads.
+
+    Returns None when the request carries a bearer token the configured auth
+    provider verifies, otherwise a 401 response. Fail-closed: with no auth
+    provider configured (legacy OAuth 2.0 / stdio mode) uploads are rejected
+    rather than exposed unauthenticated — in those modes the client shares the
+    server's filesystem and can use the ``path`` attachment parameter instead.
+    """
+    provider = get_auth_provider()
+    if provider is None:
+        return _upload_auth_error(
+            "Attachment upload requires OAuth 2.1 bearer authentication"
+        )
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return _upload_auth_error("Missing bearer token")
+
+    try:
+        verified = await provider.verify_token(auth_header[7:])
+    except Exception as exc:
+        logger.warning(f"Attachment upload token verification failed: {exc}")
+        verified = None
+    if verified is None:
+        return _upload_auth_error("Invalid or expired bearer token")
+    return None
+
+
+@server.custom_route("/attachments", methods=["POST"])
+async def upload_attachment(request: Request):
+    """Store an uploaded file in the temporary attachment store.
+
+    Lets a remote MCP client push local file bytes to the server, then
+    reference the returned ``/attachments/{id}`` URL from the ``attachments``
+    parameter of send_gmail_message / draft_gmail_message (same store, TTL and
+    serving route as get_gmail_attachment_content downloads). Accepts the raw
+    file as the request body (Content-Type honored) or a multipart/form-data
+    file field. Filename comes from the X-Filename header or ``filename``
+    query parameter.
+    """
+    import base64
+
+    from core.attachment_storage import get_attachment_storage, get_attachment_url
+
+    auth_error = await _verify_upload_bearer(request)
+    if auth_error is not None:
+        return auth_error
+
+    def _too_large() -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": (
+                    f"Attachment exceeds {MAX_UPLOAD_ATTACHMENT_BYTES} bytes "
+                    "(25 MB Gmail limit)"
+                )
+            },
+            status_code=413,
+        )
+
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit():
+        if int(content_length) > MAX_UPLOAD_ATTACHMENT_BYTES:
+            return _too_large()
+
+    filename = request.headers.get("x-filename") or request.query_params.get(
+        "filename"
+    )
+    content_type = request.headers.get("content-type", "")
+    mime_type = content_type.split(";", 1)[0].strip().lower() or None
+
+    if mime_type == "multipart/form-data":
+        try:
+            form = await request.form()
+        except Exception as exc:
+            logger.warning(f"Attachment upload multipart parse failed: {exc}")
+            return JSONResponse(
+                {"error": "Malformed multipart body; send the raw file bytes instead"},
+                status_code=400,
+            )
+        upload = next((v for v in form.values() if hasattr(v, "read")), None)
+        if upload is None:
+            return JSONResponse(
+                {"error": "Multipart body contains no file field"}, status_code=400
+            )
+        chunks: list[bytes] = []
+        total_bytes = 0
+        while True:
+            chunk = await upload.read(256 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_ATTACHMENT_BYTES:
+                return _too_large()
+            chunks.append(chunk)
+        body = b"".join(chunks)
+        filename = filename or getattr(upload, "filename", None)
+        mime_type = getattr(upload, "content_type", None) or None
+    else:
+        chunks = []
+        total_bytes = 0
+        async for chunk in request.stream():
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_ATTACHMENT_BYTES:
+                return _too_large()
+            chunks.append(chunk)
+        body = b"".join(chunks)
+
+    if not body:
+        return JSONResponse({"error": "Empty request body"}, status_code=400)
+
+    storage = get_attachment_storage()
+    storage.cleanup_expired()
+    saved = storage.save_attachment(
+        base64.urlsafe_b64encode(body).decode("ascii"),
+        filename=filename,
+        mime_type=mime_type,
+    )
+    metadata = storage.get_attachment_metadata(saved.file_id) or {}
+
+    return JSONResponse(
+        {
+            "url": get_attachment_url(saved.file_id),
+            "expires_in": storage.expiration_seconds,
+            "size": len(body),
+            "filename": metadata.get("filename"),
+        },
+        status_code=201,
+    )
+
+
 async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
     code = request.query_params.get("code")
