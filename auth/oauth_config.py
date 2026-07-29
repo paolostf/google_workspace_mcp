@@ -137,13 +137,13 @@ class OAuthConfig:
         # Don't set FASTMCP_SERVER_AUTH if using external OAuth provider
         # (external OAuth means protocol-level auth is disabled, only tool-level auth)
         if not self.external_oauth21_provider:
-            # RotationGraceGoogleProvider, not the stock GoogleProvider: it
-            # keeps a just-rotated refresh token valid for a short grace
-            # window so concurrent refreshes from parallel workers cannot
-            # revoke the grant. See auth/rotation_grace_provider.py.
+            # NOTE: core/server.py instantiates the provider directly, so this
+            # env var does not select the class in this deployment; the
+            # rotation-grace subclass is wired there. Kept pointing at the
+            # stock provider for any path that builds auth from settings.
             _set_if_absent(
                 "FASTMCP_SERVER_AUTH",
-                "auth.rotation_grace_provider.RotationGraceGoogleProvider"
+                "fastmcp.server.auth.providers.google.GoogleProvider"
                 if self.oauth21_enabled
                 else None,
             )

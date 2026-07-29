@@ -32,6 +32,7 @@ from core.config import (
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
+from auth.rotation_grace_provider import RotationGraceGoogleProvider
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
@@ -631,7 +632,11 @@ def configure_server_for_http():
                         "OAuth 2.1: restricting DCR client redirect URIs to allowlist: %s",
                         allowed_client_redirect_uris,
                     )
-                provider = GoogleProvider(
+                # RotationGraceGoogleProvider, not the stock GoogleProvider:
+                # it keeps a just-rotated refresh token valid for a short
+                # grace window so concurrent refreshes from parallel clients
+                # cannot revoke the grant. See auth/rotation_grace_provider.py.
+                provider = RotationGraceGoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
                     base_url=config.get_oauth_base_url(),
