@@ -658,8 +658,13 @@ def configure_server_for_http():
                     cimd_manager.default_scope = cimd_default_scope
                 # Enable protocol-level auth
                 server.auth = provider
+                # Name the actual class: the provider is selected by
+                # FASTMCP_SERVER_AUTH, so a static string here cannot show
+                # whether a subclass (e.g. RotationGraceGoogleProvider) is
+                # really in force.
                 logger.info(
-                    "OAuth 2.1 enabled using FastMCP GoogleProvider with protocol-level auth"
+                    "OAuth 2.1 enabled with protocol-level auth using provider %s",
+                    type(provider).__name__,
                 )
 
             # Always set auth provider for token validation in middleware
