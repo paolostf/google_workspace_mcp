@@ -20,6 +20,10 @@ from auth.oauth21_session_store import (
     get_oauth21_session_store,
     ensure_session_from_access_token,
 )
+from auth.static_bearer import (
+    StaticBearerAccessToken,
+    load_static_account_credentials,
+)
 from auth.oauth_config import (
     is_oauth21_enabled,
     get_oauth_config,
@@ -364,6 +368,34 @@ async def get_authenticated_google_service_oauth21(
             raise GoogleAuthenticationError(
                 f"Authenticated account {token_email} does not match requested user {user_google_email}."
             )
+
+        if isinstance(access_token, StaticBearerAccessToken):
+            # Static bearer keys are opaque pre-shared secrets, not Google
+            # tokens: load the mapped account's stored Google credentials via
+            # the same downstream loaders the OAuth flows use.
+            credentials = load_static_account_credentials(
+                resolved_email, required_scopes
+            )
+            if not credentials:
+                raise GoogleAuthenticationError(
+                    f"Static bearer key is valid but no stored Google credentials "
+                    f"were found for '{resolved_email}'. Complete the OAuth flow "
+                    f"for that account once so its credentials are stored, then retry."
+                )
+
+            scopes_available = set(credentials.scopes or [])
+            if not has_required_scopes(scopes_available, required_scopes):
+                raise GoogleAuthenticationError(
+                    f"Stored credentials for '{resolved_email}' lack required scopes. "
+                    f"Need: {required_scopes}, Have: {sorted(scopes_available)}"
+                )
+
+            service = build(service_name, version, credentials=credentials)
+            logger.info(
+                f"[{tool_name}] Authenticated {service_name} for "
+                f"{resolved_email} via static bearer"
+            )
+            return service, resolved_email
 
         credentials = ensure_session_from_access_token(
             access_token, resolved_email, session_id
