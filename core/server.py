@@ -672,6 +672,13 @@ def configure_server_for_http():
                     type(provider).__name__,
                 )
 
+            # Additive static bearer mode: env-configured pre-shared keys
+            # mapped to account emails (GWS_STATIC_BEARERS). No-op passthrough
+            # when the env var is absent or malformed (fail-closed).
+            from auth.static_bearer import install_static_bearer_verification
+
+            install_static_bearer_verification(provider)
+
             # Always set auth provider for token validation in middleware
             set_auth_provider(provider)
             _auth_provider = provider
