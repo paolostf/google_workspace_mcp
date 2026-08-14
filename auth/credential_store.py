@@ -5,6 +5,7 @@ This module provides a standardized interface for credential storage and retriev
 supporting multiple backends configurable via environment variables.
 """
 
+import base64
 import json
 import logging
 import os
@@ -534,12 +535,261 @@ def _parse_bool_env(value: Optional[str]) -> bool:
     )
 
 
-def get_selected_backend() -> str:
-    """Return the configured credential store backend."""
-    return (
-        os.getenv("WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND", "").strip().lower()
-        or "local_directory"
+def _derive_credential_fernet():
+    """Derive a stable Fernet key from high-entropy env material.
+
+    Uses FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY (fallback
+    GOOGLE_OAUTH_CLIENT_SECRET), the same material the OAuth 2.1 proxy uses to
+    encrypt its Valkey client_storage, so the key is stable across redeploys and
+    never itself stored. Returns None when no material is configured (dev only),
+    in which case values are stored unencrypted.
+    """
+    material = (
+        os.getenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "").strip()
+        or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
     )
+    if not material:
+        logger.warning(
+            "ValkeyCredentialStore: no FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY or "
+            "GOOGLE_OAUTH_CLIENT_SECRET configured; credentials will be stored UNENCRYPTED."
+        )
+        return None
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    derived = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"gws-credential-store",
+        info=b"fernet-key-v1",
+    ).derive(material.encode("utf-8"))
+    return Fernet(base64.urlsafe_b64encode(derived))
+
+
+class ValkeyCredentialStore(CredentialStore):
+    """Credential store backed by managed Valkey/Redis, durable across redeploys.
+
+    Per-account Google credentials are stored as Fernet-encrypted JSON in the
+    SAME managed Valkey the OAuth 2.1 proxy already uses, keyed by email. This
+    honors the fleet rule "token state -> managed Redis, NOT a disk volume": on
+    Railway the app container filesystem is ephemeral, so any per-account
+    credential written to a local directory is silently wiped on every redeploy
+    (the root cause of the 2026-08 gws outage). Valkey is a separate managed
+    service with its own persistent volume, so values written once survive app
+    redeploys.
+
+    Connection reuses the OAuth-proxy Valkey env vars, so no new configuration
+    is required: WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST / _PORT / _DB / _USERNAME
+    / _PASSWORD / _USE_TLS.
+    """
+
+    KEY_PREFIX = "gws:credential:"
+    INDEX_KEY = "gws:credential:__index__"
+    SELFTEST_KEY = "gws:credential:__redeploy_selftest__"
+
+    def __init__(self, client=None):
+        self._fernet = _derive_credential_fernet()
+        if client is not None:
+            # Dependency injection for tests.
+            self._client = client
+            return
+
+        try:
+            import redis  # lazy: only the valkey backend needs it
+        except ImportError as exc:  # pragma: no cover - env-dependent
+            raise RuntimeError(
+                "ValkeyCredentialStore requires the 'redis' package. Install it, "
+                "or set WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND=local_directory."
+            ) from exc
+
+        host = (
+            os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip() or "localhost"
+        )
+        port = int(
+            os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT", "6379").strip() or "6379"
+        )
+        db = int(os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_DB", "0").strip() or "0")
+        username = (
+            os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USERNAME", "").strip() or None
+        )
+        password = (
+            os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PASSWORD", "").strip() or None
+        )
+        use_tls_raw = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USE_TLS", "").strip()
+        use_tls = _parse_bool_env(use_tls_raw) if use_tls_raw else (port == 6380)
+
+        self._client = redis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            username=username,
+            password=password,
+            ssl=use_tls,
+            socket_timeout=5,
+            socket_connect_timeout=10,
+            retry_on_timeout=True,
+            decode_responses=False,
+        )
+        logger.info(
+            "ValkeyCredentialStore initialized (host=%s, port=%s, db=%s, tls=%s, encrypted=%s)",
+            host,
+            port,
+            db,
+            use_tls,
+            self._fernet is not None,
+        )
+
+    def _key(self, user_email: str) -> str:
+        return self.KEY_PREFIX + quote(user_email, safe="@._-")
+
+    @staticmethod
+    def _to_dict(credentials: Credentials) -> dict:
+        return {
+            "token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "token_uri": credentials.token_uri,
+            "client_id": credentials.client_id,
+            "client_secret": credentials.client_secret,
+            "scopes": credentials.scopes,
+            "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+        }
+
+    @staticmethod
+    def _from_dict(creds_data: dict) -> Credentials:
+        expiry = None
+        if creds_data.get("expiry"):
+            try:
+                expiry = datetime.fromisoformat(creds_data["expiry"])
+                if expiry.tzinfo is not None:
+                    expiry = expiry.replace(tzinfo=None)
+            except (ValueError, TypeError):
+                expiry = None
+        return Credentials(
+            token=creds_data.get("token"),
+            refresh_token=creds_data.get("refresh_token"),
+            token_uri=creds_data.get("token_uri"),
+            client_id=creds_data.get("client_id"),
+            client_secret=creds_data.get("client_secret"),
+            scopes=creds_data.get("scopes"),
+            expiry=expiry,
+        )
+
+    def _encode(self, creds_data: dict) -> bytes:
+        raw = json.dumps(creds_data).encode("utf-8")
+        return self._fernet.encrypt(raw) if self._fernet else raw
+
+    def _decode(self, blob: bytes) -> dict:
+        if self._fernet:
+            blob = self._fernet.decrypt(blob)
+        return json.loads(blob.decode("utf-8"))
+
+    def get_credential(self, user_email: str) -> Optional[Credentials]:
+        if not user_email or not user_email.strip():
+            return None
+        try:
+            blob = self._client.get(self._key(user_email))
+        except Exception as exc:
+            logger.error("ValkeyCredentialStore get failed for %s: %s", user_email, exc)
+            return None
+        if not blob:
+            return None
+        try:
+            return self._from_dict(self._decode(blob))
+        except Exception as exc:
+            logger.error(
+                "ValkeyCredentialStore decode failed for %s: %s", user_email, exc
+            )
+            return None
+
+    def store_credential(self, user_email: str, credentials: Credentials) -> bool:
+        if not user_email or not user_email.strip():
+            return False
+        try:
+            self._client.set(
+                self._key(user_email), self._encode(self._to_dict(credentials))
+            )
+            self._client.sadd(self.INDEX_KEY, user_email)
+            logger.info("Stored credentials for %s in Valkey", user_email)
+            return True
+        except Exception as exc:
+            logger.error(
+                "ValkeyCredentialStore store failed for %s: %s", user_email, exc
+            )
+            return False
+
+    def delete_credential(self, user_email: str) -> bool:
+        try:
+            self._client.delete(self._key(user_email))
+            self._client.srem(self.INDEX_KEY, user_email)
+            return True
+        except Exception as exc:
+            logger.error(
+                "ValkeyCredentialStore delete failed for %s: %s", user_email, exc
+            )
+            return False
+
+    def list_users(self) -> List[str]:
+        try:
+            members = self._client.smembers(self.INDEX_KEY)
+        except Exception as exc:
+            logger.error("ValkeyCredentialStore list_users failed: %s", exc)
+            return []
+        users = [
+            m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)
+            for m in members
+        ]
+        return sorted(users)
+
+    def self_test(self) -> dict:
+        """Round-trip a sentinel through Valkey to prove writability and, across
+        a redeploy, durability. Returns the sentinel written by the PREVIOUS
+        call: after a redeploy a non-null previous_sentinel proves stored values
+        survived the redeploy. Exposes no credential data.
+        """
+        import time
+
+        previous = None
+        try:
+            raw = self._client.get(self.SELFTEST_KEY)
+            if raw:
+                previous = (
+                    raw.decode("utf-8")
+                    if isinstance(raw, (bytes, bytearray))
+                    else str(raw)
+                )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        now = str(int(time.time()))
+        try:
+            self._client.set(self.SELFTEST_KEY, now.encode("utf-8"))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "previous_sentinel": previous}
+        return {"ok": True, "previous_sentinel": previous, "current_sentinel": now}
+
+
+def get_selected_backend() -> str:
+    """Return the configured credential store backend.
+
+    Explicit WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND always wins. Otherwise, when
+    the OAuth 2.1 proxy already persists its state in managed Valkey
+    (WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=valkey with a host configured),
+    per-account credentials are kept in that SAME durable Valkey rather than the
+    ephemeral local directory. On Railway the app filesystem is wiped on every
+    redeploy, so a local directory silently loses every account's credentials
+    (the 2026-08 gws outage). Auto-selecting valkey there keeps the fix on by
+    default with no extra configuration.
+    """
+    explicit = os.getenv("WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND", "").strip().lower()
+    if explicit:
+        return explicit
+    proxy_backend = os.getenv(
+        "WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", ""
+    ).strip().lower()
+    valkey_host = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip()
+    if proxy_backend == "valkey" and valkey_host:
+        return "valkey"
+    return "local_directory"
 
 
 def _selected_backend() -> str:
@@ -574,12 +824,14 @@ def get_credential_store() -> CredentialStore:
                     "for single-user deployments, or enable OAuth 2.1 mode."
                 )
             _credential_store = GCSCredentialStore()
+        elif backend == "valkey":
+            _credential_store = ValkeyCredentialStore()
         elif backend == "local_directory":
             _credential_store = LocalDirectoryCredentialStore()
         else:
             raise ValueError(
                 f"Unsupported WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND: {backend!r}. "
-                f"Expected 'local_directory' or 'gcs'."
+                f"Expected 'local_directory', 'valkey', or 'gcs'."
             )
         logger.info(f"Initialized credential store: {type(_credential_store).__name__}")
 

@@ -703,21 +703,115 @@ def get_auth_provider() -> Optional[GoogleProvider]:
     return _auth_provider
 
 
-@server.custom_route("/", methods=["GET"])
-@server.custom_route("/health", methods=["GET"])
-async def health_check(request: Request):
+def _server_version() -> str:
     try:
-        version = metadata.version("workspace-mcp")
+        return metadata.version("workspace-mcp")
     except metadata.PackageNotFoundError:
-        version = "dev"
+        return "dev"
+
+
+@server.custom_route("/", methods=["GET"])
+@server.custom_route("/health/live", methods=["GET"])
+async def health_live(request: Request):
+    """Liveness: 200 whenever the process is up.
+
+    This is the Railway/Docker healthcheck path, deliberately independent of
+    credential state so a deploy is never blocked by an empty credential store.
+    The durable-store fix must land BEFORE the one-time re-auth that populates
+    it, so an empty store at boot must NOT fail the deploy.
+    """
     return JSONResponse(
         {
-            "status": "healthy",
+            "status": "alive",
             "service": "workspace-mcp",
-            "version": version,
+            "version": _server_version(),
             "transport": get_transport_mode(),
         }
     )
+
+
+@server.custom_route("/health", methods=["GET"])
+async def health_check(request: Request):
+    """Readiness: 200 only when every statically-mapped account has a loadable
+    Google credential (with a refresh token); 503 otherwise.
+
+    An empty or partially-populated credential store must ALARM rather than
+    silently answer 200 (an empty store going unnoticed is what let the 2026-08
+    gws outage persist). This is NOT the deploy healthcheck; see /health/live.
+    """
+    body = {
+        "status": "healthy",
+        "service": "workspace-mcp",
+        "version": _server_version(),
+        "transport": get_transport_mode(),
+    }
+
+    try:
+        from auth.static_bearer import get_static_bearer_map
+
+        accounts = sorted(set(get_static_bearer_map().values()))
+    except Exception as e:  # pragma: no cover - defensive
+        accounts = []
+        body["static_bearer_error"] = str(e)
+
+    if accounts:
+        present, missing = [], []
+        try:
+            from auth.credential_store import get_credential_store
+
+            store = get_credential_store()
+            for email in accounts:
+                cred = await asyncio.to_thread(store.get_credential, email)
+                if cred is not None and getattr(cred, "refresh_token", None):
+                    present.append(email)
+                else:
+                    missing.append(email)
+        except Exception as e:
+            body["status"] = "degraded"
+            body["credentials_ready"] = False
+            body["credential_store_error"] = str(e)
+            return JSONResponse(body, status_code=503)
+
+        body["static_bearer_accounts"] = len(accounts)
+        body["credentials_present"] = present
+        body["credentials_missing"] = missing
+        body["credentials_ready"] = not missing
+        if missing:
+            body["status"] = "degraded"
+            return JSONResponse(body, status_code=503)
+
+    return JSONResponse(body, status_code=200)
+
+
+@server.custom_route("/health/credential-store", methods=["GET"])
+async def health_credential_store(request: Request):
+    """Durability probe: round-trips a sentinel through the credential store's
+    backend. After a redeploy, ``previous_sentinel`` is the value written by the
+    pre-redeploy call, proving stored credentials survive redeploys. Exposes no
+    credential data.
+    """
+    from auth.credential_store import get_credential_store, get_selected_backend
+
+    backend = get_selected_backend()
+    try:
+        store = get_credential_store()
+    except Exception as e:
+        return JSONResponse({"ok": False, "backend": backend, "error": str(e)}, status_code=503)
+
+    self_test = getattr(store, "self_test", None)
+    if self_test is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "backend": backend,
+                "error": "credential store backend is not durable (no self_test)",
+            },
+            status_code=200,
+        )
+
+    result = await asyncio.to_thread(self_test)
+    result["backend"] = backend
+    return JSONResponse(result, status_code=200 if result.get("ok") else 503)
 
 
 @server.custom_route("/attachments/{file_id}", methods=["GET"])
