@@ -30,6 +30,7 @@ giving up one-time-use semantics beyond that window.
 Configure with REFRESH_ROTATION_GRACE_SECONDS (default 120, 0 disables).
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -123,3 +124,105 @@ class RotationGraceGoogleProvider(GoogleProvider):
                 old_jti[:8],
             )
         return token
+
+    async def _extract_upstream_claims(self, idp_tokens):
+        """Mirror the freshly-obtained Google credential into the per-account
+        credential store keyed by email.
+
+        FastMCP's OAuth 2.1 proxy stores the upstream Google token only under the
+        proxy SESSION/client (by upstream_token_id). The static-bearer path has a
+        synthetic session and reads the per-account store by email, so without
+        this mirror an OAuth consent never reaches that store and the account
+        stays "no stored Google credentials". This hook runs on BOTH the
+        authorization-code exchange (consent) and refresh, so it seeds on consent
+        and keeps the access token fresh on refresh. Best-effort: a mirror
+        failure never breaks the OAuth flow.
+        """
+        claims = await super()._extract_upstream_claims(idp_tokens)
+        try:
+            await self._mirror_credential_to_per_account_store(idp_tokens)
+        except Exception as exc:  # never break auth on a mirror failure
+            logger.warning("Per-account credential mirror failed: %s", exc)
+        return claims
+
+    async def _mirror_credential_to_per_account_store(self, idp_tokens) -> None:
+        if not isinstance(idp_tokens, dict):
+            return
+        access_token = idp_tokens.get("access_token")
+        if not access_token:
+            return
+
+        email = await self._resolve_google_email(access_token)
+        if not email:
+            logger.warning(
+                "Per-account credential mirror: could not resolve account email; skipping."
+            )
+            return
+
+        from auth.credential_store import (
+            get_credential_store,
+            credentials_from_google_token_response,
+        )
+
+        store = get_credential_store()
+
+        refresh_token = idp_tokens.get("refresh_token")
+        if not refresh_token:
+            # Refresh-grant responses usually omit the refresh token; preserve the
+            # one already stored for this account so a refresh keeps it usable.
+            try:
+                existing = await asyncio.to_thread(store.get_credential, email)
+            except Exception:
+                existing = None
+            if existing is not None and existing.refresh_token:
+                refresh_token = existing.refresh_token
+
+        credentials = credentials_from_google_token_response(
+            idp_tokens, refresh_token=refresh_token
+        )
+        if credentials is None:
+            logger.warning(
+                "Per-account credential mirror: no refresh token available for %s; skipping.",
+                email,
+            )
+            return
+
+        stored = await asyncio.to_thread(store.store_credential, email, credentials)
+        logger.info(
+            "Per-account credential mirror: %s for %s.",
+            "stored" if stored else "store REJECTED",
+            email,
+        )
+
+    async def _resolve_google_email(self, access_token):
+        """Resolve the Google account email for an access token via tokeninfo
+        (falling back to the v2 userinfo endpoint), the same endpoints the
+        FastMCP GoogleTokenVerifier uses. Returns None on failure.
+        """
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://oauth2.googleapis.com/tokeninfo",
+                    params={"access_token": access_token},
+                    headers={"User-Agent": "gws-mcp-credential-mirror"},
+                )
+                if resp.status_code == 200:
+                    email = resp.json().get("email")
+                    if email:
+                        return email
+                resp2 = await client.get(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "User-Agent": "gws-mcp-credential-mirror",
+                    },
+                )
+                if resp2.status_code == 200:
+                    return resp2.json().get("email")
+        except Exception as exc:
+            logger.debug(
+                "Per-account credential mirror: email resolution failed: %s", exc
+            )
+        return None

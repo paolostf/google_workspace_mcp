@@ -6,14 +6,18 @@ the redeploy-survival self-test, and the backend auto-selection that keeps
 per-account credentials off the ephemeral container filesystem.
 """
 
+import asyncio
 import json
+import types
 from datetime import datetime
 
 import pytest
 from google.oauth2.credentials import Credentials
 
+from auth import rotation_grace_provider as rgp
 from auth.credential_store import (
     ValkeyCredentialStore,
+    credentials_from_google_token_response,
     get_selected_backend,
 )
 
@@ -188,3 +192,104 @@ def test_backend_defaults_to_local_directory(monkeypatch):
     monkeypatch.delenv("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", raising=False)
     monkeypatch.delenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", raising=False)
     assert get_selected_backend() == "local_directory"
+
+
+# --- OAuth-consent -> per-account mirror (the bug this fixes) ---------------
+
+
+def test_credentials_from_token_response_builds_creds(monkeypatch):
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "cid-123")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "secret-456")
+    idp = {
+        "access_token": "at",
+        "refresh_token": "rt",
+        "scope": "https://www.googleapis.com/auth/gmail.readonly openid",
+        "expires_in": 3599,
+        "token_type": "Bearer",
+    }
+    creds = credentials_from_google_token_response(idp)
+    assert creds is not None
+    assert creds.token == "at"
+    assert creds.refresh_token == "rt"
+    assert creds.client_id == "cid-123"
+    assert creds.token_uri == "https://oauth2.googleapis.com/token"
+    assert "https://www.googleapis.com/auth/gmail.readonly" in creds.scopes
+    assert creds.expiry is not None
+
+
+def test_credentials_from_token_response_requires_refresh_token():
+    assert credentials_from_google_token_response({"access_token": "at"}) is None
+    # An explicit override (e.g. preserved from a prior consent) is honored.
+    creds = credentials_from_google_token_response(
+        {"access_token": "at"}, refresh_token="rt-preserved"
+    )
+    assert creds is not None and creds.refresh_token == "rt-preserved"
+
+
+def test_oauth_consent_mirrors_into_per_account_store(monkeypatch):
+    """Regression for the wrong-store bug: an OAuth 2.1 proxy consent (idp token
+    response) must land in the per-account ValkeyCredentialStore keyed by email,
+    which is what /health and the static-bearer path read.
+    """
+    monkeypatch.setenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", SIGNING_KEY)
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "cid-123")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "secret-456")
+
+    store = ValkeyCredentialStore(client=FakeRedis())
+    monkeypatch.setattr("auth.credential_store.get_credential_store", lambda: store)
+
+    async def fake_resolve_email(access_token):
+        assert access_token == "at-deflorance"
+        return "admin@deflorance.com"
+
+    fake_self = types.SimpleNamespace(_resolve_google_email=fake_resolve_email)
+
+    idp = {
+        "access_token": "at-deflorance",
+        "refresh_token": "rt-deflorance",
+        "scope": "https://www.googleapis.com/auth/gmail.readonly",
+        "expires_in": 3599,
+    }
+    asyncio.run(
+        rgp.RotationGraceGoogleProvider._mirror_credential_to_per_account_store(
+            fake_self, idp
+        )
+    )
+
+    stored = store.get_credential("admin@deflorance.com")
+    assert stored is not None
+    assert stored.refresh_token == "rt-deflorance"
+    assert stored.token == "at-deflorance"
+    # And it now shows up for the readiness/static-bearer read path.
+    assert "admin@deflorance.com" in store.list_users()
+
+
+def test_mirror_preserves_existing_refresh_token_on_refresh(monkeypatch):
+    """A refresh-grant response omits the refresh token; the mirror must keep the
+    one already stored so the account stays usable.
+    """
+    monkeypatch.setenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", SIGNING_KEY)
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "cid-123")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "secret-456")
+
+    store = ValkeyCredentialStore(client=FakeRedis())
+    store.store_credential("admin@deflorance.com", _sample_credentials())
+    monkeypatch.setattr("auth.credential_store.get_credential_store", lambda: store)
+
+    async def fake_resolve_email(access_token):
+        return "admin@deflorance.com"
+
+    fake_self = types.SimpleNamespace(_resolve_google_email=fake_resolve_email)
+
+    # Refresh response: new access token, NO refresh token.
+    idp = {"access_token": "at-refreshed", "expires_in": 3599}
+    asyncio.run(
+        rgp.RotationGraceGoogleProvider._mirror_credential_to_per_account_store(
+            fake_self, idp
+        )
+    )
+
+    stored = store.get_credential("admin@deflorance.com")
+    assert stored is not None
+    assert stored.token == "at-refreshed"  # access token refreshed
+    assert stored.refresh_token == "refresh-token-xyz"  # preserved from before

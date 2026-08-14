@@ -11,7 +11,7 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 from urllib.parse import quote, unquote
 
@@ -766,6 +766,42 @@ class ValkeyCredentialStore(CredentialStore):
         except Exception as exc:
             return {"ok": False, "error": str(exc), "previous_sentinel": previous}
         return {"ok": True, "previous_sentinel": previous, "current_sentinel": now}
+
+
+def credentials_from_google_token_response(
+    idp_tokens: dict, refresh_token: Optional[str] = None
+) -> Optional[Credentials]:
+    """Build google ``Credentials`` from a raw Google token-endpoint response.
+
+    Used to mirror an OAuth 2.1 proxy consent/refresh into the per-account
+    credential store keyed by email, so the static-bearer path (which has no
+    OAuth session) can read it. Returns None when there is no usable access
+    token or no refresh token, since a credential without a refresh token
+    cannot be auto-refreshed and would fail on the next expiry.
+    """
+    if not isinstance(idp_tokens, dict):
+        return None
+    access_token = idp_tokens.get("access_token")
+    resolved_refresh = refresh_token or idp_tokens.get("refresh_token")
+    if not access_token or not resolved_refresh:
+        return None
+    scopes = (idp_tokens.get("scope") or "").split() or None
+    expiry = None
+    expires_in = idp_tokens.get("expires_in")
+    if expires_in is not None:
+        try:
+            expiry = datetime.utcnow() + timedelta(seconds=int(expires_in))
+        except (ValueError, TypeError):
+            expiry = None
+    return Credentials(
+        token=access_token,
+        refresh_token=resolved_refresh,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.getenv("GOOGLE_OAUTH_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
+        scopes=scopes,
+        expiry=expiry,
+    )
 
 
 def get_selected_backend() -> str:
